@@ -31,5 +31,7 @@ data/optout.txt
 .env
 *.env.local
 
-# Claude Code local session state
-.claude/
+# Claude Code local session state — ignored except for shared team configs
+.claude/*
+!.claude/agents/
+!.claude/commands/
