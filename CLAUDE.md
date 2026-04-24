@@ -52,6 +52,7 @@ cd ml && uv run pytest
 - **네임스페이스:** 최상위 `designer::`. 레이어별 서브: `designer::core::`, `designer::gd::` 등.
 - **로그:** `log::info`, `log::warn`. 에러 경로는 alert 띄우지 말고 `log::error` + 사용자 친화 alert는 `ui/` 레이어에서만.
 - **커밋 메시지:** 제목은 영어 imperative ("Add X", "Fix Y"). 본문은 한국어/영어 혼용 OK.
+- **스크립트 설정:** argparse/CLI flag 지양. 기본은 `config.py` 모듈 상수 또는 설정 파일. 값 변경은 config 편집, 꼭 필요한 override만 최소 arg.
 
 ## Never / Always
 
