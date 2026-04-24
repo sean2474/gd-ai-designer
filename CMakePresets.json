@@ -1,0 +1,27 @@
+{
+	"version": 3,
+	"cmakeMinimumRequired": {
+		"major": 3,
+		"minor": 21,
+		"patch": 0
+	},
+	"configurePresets": [
+		{
+			"name": "mac",
+			"displayName": "macOS",
+			"description": "Build for macOS (Universal)",
+			"generator": "Ninja",
+			"binaryDir": "${sourceDir}/build",
+			"cacheVariables": {
+				"CMAKE_BUILD_TYPE": "RelWithDebInfo",
+				"CMAKE_OSX_ARCHITECTURES": "arm64;x86_64"
+			}
+		}
+	],
+	"buildPresets": [
+		{
+			"name": "mac",
+			"configurePreset": "mac"
+		}
+	]
+}
