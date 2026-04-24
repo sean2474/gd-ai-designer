@@ -209,8 +209,55 @@ HTTP 4xx/5xx 의 본문.
 - `INVALID_OPTIONS` — options 범위 밖
 - `PLANNER_FAILED` — Anthropic 호출 실패
 - `DESIGNER_FAILED` — 추론 실패
+- `ENCODER_FAILED` — encoder 추론 실패
 - `TIMEOUT` — 서버 내부 타임아웃
 - `INTERNAL` — 그 외 (스택트레이스는 서버 로그로만)
+
+### 2.8 `SymbolicWindow` (encoder 입력/학습 데이터)
+
+Phase 4 encoder 가 먹는 윈도우 단위 표현. 하나의 레벨 구간 `[n - c, n + c]` (x축, GD units) 의 오브젝트들을 토큰 시퀀스로.
+
+```json
+{
+  "schema_version": "1.0",
+  "level_id": 1234567,
+  "center_x": 120.0,
+  "radius_units": 30,
+  "objects": [
+    {
+      "rel_x": -28.0,
+      "y": 15.0,
+      "kind": 3,
+      "game_object_type": 2,
+      "rotation_bucket": 0,
+      "scale_bucket": 3,
+      "color_bucket": 0
+    }
+  ]
+}
+```
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `level_id` | int | 원본 레벨 (creator 속성 유지용) |
+| `center_x` | float | 윈도우 중심 x (units, 레벨 절대) |
+| `radius_units` | int | 윈도우 반경 (기본 30, = 블록 1개) |
+| `objects[].rel_x` | float | 윈도우 중심 기준 상대 x (units, `[-c, +c]`) |
+| `objects[].y` | float | 절대 y (units, `[0, 32]` 가정) |
+| `objects[].kind` | int | ObjectKind enum (§2.1) |
+| `objects[].game_object_type` | int | GD `GameObjectType` enum (Geode Enums.hpp). MVP 토크나이저 옵션 |
+| `objects[].rotation_bucket` | int | `[0, 8)` — 45° 단위 |
+| `objects[].scale_bucket` | int | `[0, 8)` — log-quantized (ENCODER.md §11.2) |
+| `objects[].color_bucket` | int | `[0, 33)` — 색 채널 |
+
+**불변식:**
+- `objects` 는 (rel_x, y, id) 오름차순 정렬.
+- `|objects|` ≤ 128 (`N_obj_max`).
+- `rel_x` 범위: `[-radius_units, +radius_units]`.
+- `DECORATION` kind 는 학습 윈도우에 포함 여부를 `include_decoration` flag (encoder 설정) 로 제어 — layout only / deco only / both.
+
+**윈도우 생성 배치:**
+한 레벨 → 여러 `SymbolicWindow` (stride=5 units). 저장: `data/processed/encoder/{level_id}/window_{idx:05d}.json` (또는 tensor-packed `.pt`/`.npz`).
 
 ---
 

@@ -30,7 +30,9 @@ USER_AGENT = "GDDesignAI-Crawler/0.1.0 (+https://github.com/sean2474/gd-ai-desig
 BACKOFF_SCHEDULE_SEC = (10, 30, 60, 120)
 OBJECT_COUNT_MIN = 10
 OBJECT_COUNT_MAX = 20_000
-MIN_GAME_VERSION = 20  # GD 2.0+; gd.py encodes 2.0 as 20, 2.1 as 21, 2.2 as 22
+MIN_GAME_VERSION = 21  # 2.1+; 2.0 has different object set (DATA_COLLECTION.md §3)
+MIN_UPLOAD_YEAR = 2019  # decoration conventions stabilize after 2019-01-01
+MIN_X_WIDTH_UNITS = 120  # ensures ≥ 2 encoder windows (ENCODER.md §1)
 
 
 @dataclass
@@ -274,6 +276,17 @@ def _passes_filters(
     game_version = int(getattr(level, "game_version", 0) or 0)
     if game_version and game_version < MIN_GAME_VERSION:
         return False, RejectionReason.GAME_VERSION_TOO_OLD, f"gv={game_version}"
+
+    # Upload date filter (DATA_COLLECTION.md §3): gd.py exposes this as
+    # `level.uploaded_at` (datetime) or `level.uploaded_timestamp`. Best-effort.
+    uploaded = getattr(level, "uploaded_at", None) or getattr(level, "uploaded_timestamp", None)
+    if uploaded is not None:
+        try:
+            year = uploaded.year if hasattr(uploaded, "year") else None
+            if year is not None and year < MIN_UPLOAD_YEAR:
+                return False, RejectionReason.GAME_VERSION_TOO_OLD, f"uploaded={year}"
+        except Exception:  # noqa: BLE001 — defensive; gd.py field shape varies
+            pass  # if we can't parse, let it through
 
     return True, None, ""
 

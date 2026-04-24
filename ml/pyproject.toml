@@ -4,9 +4,11 @@ version = "0.1.0"
 description = "GD Design AI - ML training and serving"
 requires-python = ">=3.11"
 dependencies = [
-    "gd.py>=1.0.0",
     "pydantic>=2.6",
     "httpx>=0.27",
+    "numpy>=1.26",
+    "scikit-learn>=1.4",
+    "torch>=2.3",
 ]
 
 [project.optional-dependencies]
