@@ -5,3 +5,28 @@ build/
 .DS_Store
 *.geode
 CMakeUserPresets.json
+
+# Python
+**/__pycache__/
+**/.venv/
+**/*.egg-info/
+.python-version
+
+# ML artifacts
+checkpoints/
+runs/
+
+# Dataset — never commit raw levels / processed data (creator rights)
+data/raw/
+data/interim/
+data/processed/
+data/rejection_log.jsonl
+data/optout.txt
+# but keep small samples for testing:
+!data/samples/
+# and the manifest (level IDs + hashes) for reproducibility:
+!data/manifest.csv
+
+# Env
+.env
+*.env.local
