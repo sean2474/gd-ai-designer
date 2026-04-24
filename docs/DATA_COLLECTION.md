@@ -38,28 +38,37 @@ Designer 모델 학습에 쓸 (layout, decoration) 쌍을 **초반 1회** 대량
 
 ---
 
-## 2. 수집 경로
+## 2. 수집 경로 (하이브리드)
 
-### 2.1 기본 경로: `gd.py`
+**구현: `ml/src/gd_designer/data/fetch.py` (httpx 기반, 비동기).**
 
-Python 라이브러리 `gd.py` (비공식 GD API wrapper) 사용.
+레벨 한 건을 완전히 수집하려면 *메타* 와 *레벨 string* 두 조각이 필요하다. 각각 다른 소스가 제일 실용적이라 **두 엔드포인트를 조합** 한다.
 
-- GitHub: https://github.com/nekitdev/gd.py
-- pip 로 `ml/` 의존성에 포함
+### 2.1 메타 / 검색 — GDBrowser API
 
-**왜 `gd.py` 를 선택:**
-- 레벨 메타 + 레벨 string 압축 해제까지 한 번에 처리
-- 검색 / 페이징 / 정렬 API 래핑됨
-- async 지원 → 레이트 리밋 적용이 깔끔
+`https://gdbrowser.com/api/search/*?type=<tier>&page=<n>`
 
-### 2.2 백업 경로: GDBrowser API
+- tier 값: `featured | epic | legendary | mythic` (이 프로젝트 대상 전부).
+- 응답 JSON 에 `epicValue` (0~3) 와 각종 boolean flag — `_rating_from_gdbrowser` 가 가장 specific 한 tier 로 정확 분류 (Mythic > Legendary > Epic > Featured).
+- `gameVersion: "2.2"` 를 내부적으로 `22` 로 변환하여 `MIN_GAME_VERSION = 21` 필터 적용.
+- `uploaded: "2 years"` 같은 fuzzy 문자열을 `_parse_upload_year` 로 처리, `MIN_UPLOAD_YEAR = 2019` 필터 적용.
+- **왜 여기서?** — RobTop 서버는 페이징 tier 검색이 번거롭고 레이트 리밋도 tight. GDBrowser 는 이미 이 용도로 운영 중이라 마찰 적음.
 
-`gd.py` 가 막히거나 교차 검증 필요 시 `gdbrowser.com/api` 를 보조로 사용. 프로덕션 수집 시에는 기본 아님.
+### 2.2 Level string — RobTop GD 서버 직접
 
-### 2.3 피하는 경로
+`http://www.boomlings.com/database/downloadGJLevel22.php`
 
-- GD 서버에 대한 **raw HTTP 재구현** — 유지보수 지옥. 라이브러리 쓰자.
-- 스크린스크래핑 (gdbrowser 웹 HTML 파싱) — 깨지기 쉬움, 불친절.
+- POST body에 `levelID` + `secret=Wmfd2893gb7` (GD 클라이언트가 보내는 공개 상수).
+- 응답은 `k:v:k:v:...#hash` 형태. `_parse_gd_kv` 로 dict 변환 후 `k4` 필드가 **gzip + base64** 압축된 레벨 스트링.
+- **왜 직접?** GDBrowser 는 레벨 페이로드는 서빙하지 않음. gd.py 래퍼는 `torch`/`httpx` 외에 무거운 의존성을 끌어오고 v2.2 mythic 등 최신 플래그가 버전별로 불일치.
+- User-Agent 는 비워둠 (RobTop 서버는 브라우저 UA 를 거부).
+
+### 2.3 공식 API 는 없음
+
+RobTop 은 공식 API 를 공개한 적 없음. 위 경로는 모두 **커뮤니티 리버스엔지니어링**. 언제든 깨질 수 있으므로:
+- 수집 스크립트는 재실행 가능 (idempotent).
+- 한 번 받은 raw 는 로컬 캐시 (`data/raw/`) 에 저장, 재다운로드 최소화.
+- 스키마가 변하면 `schema_version` 을 bump 해서 마이그레이션.
 
 ---
 
@@ -290,7 +299,8 @@ uv run python scripts/prepare_training.py \
 
 | 리스크 | 완화 |
 |---|---|
-| GD 서버 API 가 변경됨 | `gd.py` 업스트림 의존, 브레이킹 시 pin 버전 유지 + 수동 패치 |
+| GD 서버 응답 포맷 변경 | fetch.py 가 얇은 wrapper라 재작성 쉬움. 기존 `data/raw/` 캐시는 schema_version 으로 버전업 마이그레이션 |
+| GDBrowser API 변경/중단 | level_string 은 RobTop 직접 호출이라 영향 제한적. 검색만 못 하게 되면 수동 level_id 목록으로 fallback |
 | 레이트 리밋으로 수집이 느림 | 수 시간 여유 잡고 저녁에 시작, 백오프 준수 |
 | Creator 불만 제기 | opt-out 즉시 반영, 정책 문서화 |
 | 레벨 string 포맷 업데이트 (2.3 등) | 파싱 실패 로그 모니터 + 커뮤니티 문서 참조 |

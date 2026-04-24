@@ -1,18 +1,22 @@
-"""Stage 1 fetcher. Pulls rated GD levels via gd.py and saves raw JSON per level.
+"""Stage 1 fetcher. Hybrid fetch: GDBrowser API for discovery/metadata
+(clean 2.2 tier classification), RobTop GD server for the raw level string
+(GDBrowser doesn't serve level payloads).
 
 Spec: docs/DATA_COLLECTION.md §§2-5, §9. Output schema: schema.RawLevel.
+Output: one JSON per level under data/raw/. SQLite migration deferred.
 """
 from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
+import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-import gd
+import httpx
 
 from .rate_limiter import FailureStreak, TokenBucket
 from .schema import (
@@ -26,13 +30,21 @@ from .schema import (
 
 log = logging.getLogger(__name__)
 
+# ---- endpoints ----
+GDBROWSER_BASE = "https://gdbrowser.com"
+GD_BASE = "http://www.boomlings.com/database"
+GD_SECRET = "Wmfd2893gb7"  # public "download level" secret, same value GD client sends
 USER_AGENT = "GDDesignAI-Crawler/0.1.0 (+https://github.com/sean2474/gd-ai-designer)"
+
+# ---- filter thresholds (per DATA_COLLECTION.md §3 + user additions) ----
 BACKOFF_SCHEDULE_SEC = (10, 30, 60, 120)
 OBJECT_COUNT_MIN = 10
 OBJECT_COUNT_MAX = 20_000
-MIN_GAME_VERSION = 21  # 2.1+; 2.0 has different object set (DATA_COLLECTION.md §3)
-MIN_UPLOAD_YEAR = 2019  # decoration conventions stabilize after 2019-01-01
-MIN_X_WIDTH_UNITS = 120  # ensures ≥ 2 encoder windows (ENCODER.md §1)
+MIN_GAME_VERSION = 21       # 2.1+; 2.0 uses different object set
+MIN_UPLOAD_YEAR = 2019      # decoration conventions stabilize after 2019-01-01
+MIN_X_WIDTH_UNITS = 120     # ≥ 2 encoder windows; enforced in Stage 2 (needs parsed data)
+
+_YEARS_AGO = re.compile(r"(\d+)\s*year", re.IGNORECASE)
 
 
 @dataclass
@@ -44,7 +56,7 @@ class FetchConfig:
     max_pages_per_query: int = 100
     force: bool = False
     from_manifest: Path | None = None
-    max_levels: int | None = None  # dry-run cap
+    max_levels: int | None = None
 
 
 @dataclass
@@ -56,45 +68,80 @@ class FetchStats:
     by_rating: dict[str, int] = field(default_factory=dict)
 
 
-# ---------- rating classification ----------
+# ---------- GDBrowser metadata helpers ----------
 
 
-def _classify_rating(level: gd.Level) -> Rating | None:
-    """Return the highest applicable trophy tier, or None if unrated.
+_GDBROWSER_TYPE_FOR_RATING = {
+    Rating.FEATURED: "featured",
+    Rating.EPIC: "epic",
+    Rating.LEGENDARY: "legendary",
+    Rating.MYTHIC: "mythic",
+}
 
-    gd.py exposes tier flags on the Level model. We probe them defensively because
-    the mythic tier was added in GD 2.2 and older gd.py versions may not ship it.
-    """
-    # Prefer the most specific tier first.
-    if getattr(level, "is_mythic", lambda: False)():
+
+def _rating_from_gdbrowser(meta: dict) -> Rating | None:
+    """GDBrowser exposes booleans + `epicValue` (0..3). Use the most specific tier."""
+    ev = meta.get("epicValue", 0) or 0
+    if ev == 3 or meta.get("mythic"):
         return Rating.MYTHIC
-    if getattr(level, "is_legendary", lambda: False)():
+    if ev == 2 or meta.get("legendary"):
         return Rating.LEGENDARY
-    if getattr(level, "is_epic", lambda: False)():
+    if ev == 1 or meta.get("epic"):
         return Rating.EPIC
-    if getattr(level, "is_featured", lambda: False)():
+    if meta.get("featured"):
         return Rating.FEATURED
     return None
 
 
-def _normalize_length(level: gd.Level) -> Length:
-    raw = getattr(level, "length", None)
-    name = getattr(raw, "name", str(raw)).lower()
+def _length_from_gdbrowser(meta: dict) -> Length:
+    name = str(meta.get("length", "")).lower()
+    if meta.get("platformer"):
+        return Length.PLATFORMER
     try:
         return Length(name)
     except ValueError:
-        # Unknown — treat as XL to avoid data loss; rejection filter may still drop it.
         return Length.XL
 
 
-def _is_platformer(level: gd.Level) -> bool:
-    fn = getattr(level, "is_platformer", None)
-    if callable(fn):
-        return bool(fn())
-    return bool(getattr(level, "platformer", False))
+def _game_version_int(meta: dict) -> int:
+    """GDBrowser returns gameVersion as e.g. "2.2" — convert to 22."""
+    raw = str(meta.get("gameVersion", "") or "")
+    if not raw:
+        return 0
+    if "." in raw:
+        a, b = raw.split(".", 1)
+        try:
+            return int(a) * 10 + int(b[:1])
+        except ValueError:
+            return 0
+    try:
+        return int(raw)
+    except ValueError:
+        return 0
 
 
-# ---------- paths / IO ----------
+# ---------- GD server response parsing ----------
+
+
+def _parse_gd_kv(body: str) -> dict[str, str]:
+    """RobTop's downloadGJLevel22 returns `k:v:k:v:...#hash`. Parse to dict."""
+    head, _, _tail = body.partition("#")
+    parts = head.split(":")
+    return {parts[i]: parts[i + 1] for i in range(0, len(parts) - 1, 2)}
+
+
+def _parse_upload_year(uploaded_text: str, today: datetime) -> int | None:
+    """GD returns fuzzy strings like "2 years" / "5 months" / "3 weeks". Best-effort year."""
+    if not uploaded_text:
+        return None
+    m = _YEARS_AGO.search(uploaded_text)
+    if m:
+        return today.year - int(m.group(1))
+    # months/weeks/days all mean same-year-ish — return current year.
+    return today.year
+
+
+# ---------- IO ----------
 
 
 def _level_path(cfg: FetchConfig, level_id: int) -> Path:
@@ -106,23 +153,15 @@ def _write_raw(path: Path, raw: RawLevel) -> None:
     path.write_text(raw.model_dump_json(indent=2), encoding="utf-8")
 
 
-def _rejection_log_path(cfg: FetchConfig) -> Path:
-    return cfg.output_dir.parent / "rejection_log.jsonl"
-
-
 def _append_rejection(cfg: FetchConfig, entry: RejectionEntry) -> None:
-    path = _rejection_log_path(cfg)
+    path = cfg.output_dir.parent / "rejection_log.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(entry.model_dump_json() + "\n")
 
 
-def _manifest_path(cfg: FetchConfig) -> Path:
-    return cfg.output_dir.parent / "manifest.csv"
-
-
 def _append_manifest(cfg: FetchConfig, entry: ManifestEntry) -> None:
-    path = _manifest_path(cfg)
+    path = cfg.output_dir.parent / "manifest.csv"
     new = not path.exists()
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
@@ -157,7 +196,7 @@ def _read_manifest_ids(path: Path) -> list[int]:
     return ids
 
 
-# ---------- backoff-aware single call ----------
+# ---------- backoff ----------
 
 
 async def _with_backoff(
@@ -167,7 +206,6 @@ async def _with_backoff(
     label: str = "",
     **kwargs: Any,
 ) -> Any:
-    """Run an awaitable with the §4.3 schedule on 429/503-like errors."""
     last_exc: BaseException | None = None
     for delay in (0, *BACKOFF_SCHEDULE_SEC):
         if delay:
@@ -179,7 +217,7 @@ async def _with_backoff(
             return result
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # gd.py wraps HTTP errors; treat all as retryable here
+        except Exception as exc:
             last_exc = exc
             log.debug("call failed (%s): %r", label, exc)
     await streak.failure()
@@ -187,130 +225,97 @@ async def _with_backoff(
     raise last_exc
 
 
-# ---------- discovery ----------
+# ---------- HTTP calls ----------
 
 
-async def _search_level_ids(
-    client: gd.Client,
-    rating: Rating,
-    cfg: FetchConfig,
-    bucket: TokenBucket,
-    streak: FailureStreak,
-) -> list[int]:
-    """Walk search pages for one rating tier, return deduped level ids.
-
-    gd.py's search API changes between versions; we lean on SearchStrategy enum values
-    that have been stable (FEATURED, EPIC, AWARDED). Mythic/Legendary share the EPIC
-    strategy and are filtered by tier flag on the level object during download.
-    """
-    strategy_name = {
-        Rating.FEATURED: "FEATURED",
-        Rating.EPIC: "EPIC",
-        Rating.LEGENDARY: "EPIC",
-        Rating.MYTHIC: "EPIC",
-    }[rating]
-
-    SearchStrategy = getattr(gd, "SearchStrategy", None)
-    strategy = getattr(SearchStrategy, strategy_name, None) if SearchStrategy else None
-    if strategy is None:
-        log.error("gd.py missing SearchStrategy.%s; skipping %s", strategy_name, rating.value)
-        return []
-
-    ids: list[int] = []
-    seen: set[int] = set()
-    for page in range(cfg.max_pages_per_query):
-        await bucket.acquire()
-        try:
-            results = await _with_backoff(
-                client.search_levels_on_page,
-                strategy=strategy,
-                page=page,
-                streak=streak,
-                label=f"search {rating.value} p{page}",
-            )
-        except Exception as exc:
-            log.error("search gave up at %s p%d: %r", rating.value, page, exc)
-            break
-
-        page_ids = [int(lvl.id) for lvl in results] if results else []
-        if not page_ids:
-            break
-
-        new = [i for i in page_ids if i not in seen]
-        if not new:
-            # Page returned only duplicates → exhausted.
-            break
-        seen.update(new)
-        ids.extend(new)
-
-        if cfg.max_levels and len(ids) >= cfg.max_levels:
-            break
-
-    return ids
+async def _gdbrowser_search(
+    http: httpx.AsyncClient, search_type: str, page: int
+) -> list[dict]:
+    resp = await http.get(
+        f"{GDBROWSER_BASE}/api/search/*",
+        params={"type": search_type, "page": page},
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data if isinstance(data, list) else []
 
 
-# ---------- per-level download + filter ----------
+async def _gd_download(http: httpx.AsyncClient, level_id: int) -> dict[str, str]:
+    """Direct RobTop download. Requires empty UA (GD client sends no UA)."""
+    resp = await http.post(
+        f"{GD_BASE}/downloadGJLevel22.php",
+        data={"levelID": str(level_id), "secret": GD_SECRET},
+        headers={"User-Agent": ""},
+    )
+    resp.raise_for_status()
+    body = resp.text
+    if body.strip() == "-1":
+        raise ValueError(f"GD server returned -1 for level {level_id}")
+    return _parse_gd_kv(body)
 
 
-def _passes_filters(
-    level: gd.Level,
-    level_string: str,
-    cfg: FetchConfig,
-) -> tuple[bool, RejectionReason | None, str]:
-    rating = _classify_rating(level)
+# ---------- filters ----------
+
+
+def _check_metadata(
+    meta: dict, cfg: FetchConfig
+) -> tuple[Rating | None, RejectionReason | None, str]:
+    rating = _rating_from_gdbrowser(meta)
     if rating is None:
-        return False, RejectionReason.NOT_RATED, ""
+        return None, RejectionReason.NOT_RATED, ""
     if rating not in cfg.ratings:
-        return False, RejectionReason.NOT_RATED, f"tier {rating.value} not requested"
+        return rating, RejectionReason.NOT_RATED, f"tier {rating.value} not requested"
 
-    if cfg.exclude_platformer and _is_platformer(level):
-        return False, RejectionReason.PLATFORMER, ""
+    if cfg.exclude_platformer and meta.get("platformer"):
+        return rating, RejectionReason.PLATFORMER, ""
 
-    object_count = int(getattr(level, "object_count", 0) or 0)
-    if not (OBJECT_COUNT_MIN <= object_count <= OBJECT_COUNT_MAX):
-        return False, RejectionReason.OBJECT_COUNT_OUT_OF_RANGE, f"n={object_count}"
+    obj_count = int(meta.get("objects", 0) or 0)
+    if not (OBJECT_COUNT_MIN <= obj_count <= OBJECT_COUNT_MAX):
+        return rating, RejectionReason.OBJECT_COUNT_OUT_OF_RANGE, f"n={obj_count}"
 
-    if not level_string or ";" not in level_string:
-        return False, RejectionReason.EMPTY_LEVEL_STRING, ""
+    gv = _game_version_int(meta)
+    if gv and gv < MIN_GAME_VERSION:
+        return rating, RejectionReason.GAME_VERSION_TOO_OLD, f"gv={gv}"
 
-    game_version = int(getattr(level, "game_version", 0) or 0)
-    if game_version and game_version < MIN_GAME_VERSION:
-        return False, RejectionReason.GAME_VERSION_TOO_OLD, f"gv={game_version}"
-
-    # Upload date filter (DATA_COLLECTION.md §3): gd.py exposes this as
-    # `level.uploaded_at` (datetime) or `level.uploaded_timestamp`. Best-effort.
-    uploaded = getattr(level, "uploaded_at", None) or getattr(level, "uploaded_timestamp", None)
-    if uploaded is not None:
-        try:
-            year = uploaded.year if hasattr(uploaded, "year") else None
-            if year is not None and year < MIN_UPLOAD_YEAR:
-                return False, RejectionReason.GAME_VERSION_TOO_OLD, f"uploaded={year}"
-        except Exception:  # noqa: BLE001 — defensive; gd.py field shape varies
-            pass  # if we can't parse, let it through
-
-    return True, None, ""
+    return rating, None, ""
 
 
-async def _download_and_save(
-    client: gd.Client,
-    level_id: int,
+# ---------- per-level ----------
+
+
+async def _process_level(
+    http: httpx.AsyncClient,
+    meta: dict,
     cfg: FetchConfig,
     bucket: TokenBucket,
     streak: FailureStreak,
     stats: FetchStats,
 ) -> None:
+    try:
+        level_id = int(meta["id"])
+    except (KeyError, ValueError):
+        stats.errors += 1
+        return
+
     path = _level_path(cfg, level_id)
     if path.exists() and not cfg.force:
         stats.skipped_existing += 1
         return
 
+    rating, reject, detail = _check_metadata(meta, cfg)
+    if reject is not None:
+        stats.rejected += 1
+        _append_rejection(
+            cfg,
+            RejectionEntry(level_id=level_id, reason=reject, detail=detail),
+        )
+        return
+    assert rating is not None
+
     await bucket.acquire()
     try:
-        level: gd.Level = await _with_backoff(
-            client.get_level,
-            level_id,
-            streak=streak,
-            label=f"get_level {level_id}",
+        kv = await _with_backoff(
+            _gd_download, http, level_id, streak=streak, label=f"download {level_id}"
         )
     except Exception as exc:
         stats.errors += 1
@@ -324,51 +329,51 @@ async def _download_and_save(
         )
         return
 
-    # gd.py exposes the decompressed level string on `.data`. See DATA_COLLECTION.md §2.1.
-    level_string = getattr(level, "data", "") or ""
-
-    ok, reject_reason, detail = _passes_filters(level, level_string, cfg)
-    if not ok:
+    level_string = kv.get("4", "")
+    if not level_string:
         stats.rejected += 1
-        assert reject_reason is not None
         _append_rejection(
             cfg,
-            RejectionEntry(level_id=level_id, reason=reject_reason, detail=detail),
+            RejectionEntry(level_id=level_id, reason=RejectionReason.EMPTY_LEVEL_STRING),
         )
         return
 
-    rating = _classify_rating(level)
-    assert rating is not None
+    # Secondary filter: upload year (key 28 = "X years/months/weeks ago" text).
+    now = datetime.now(timezone.utc)
+    upload_year = _parse_upload_year(kv.get("28", ""), now)
+    if upload_year is not None and upload_year < MIN_UPLOAD_YEAR:
+        stats.rejected += 1
+        _append_rejection(
+            cfg,
+            RejectionEntry(
+                level_id=level_id,
+                reason=RejectionReason.GAME_VERSION_TOO_OLD,
+                detail=f"uploaded ~{upload_year} (< {MIN_UPLOAD_YEAR})",
+            ),
+        )
+        return
 
-    creator_name = ""
-    creator = getattr(level, "creator", None)
-    if creator is not None:
-        creator_name = getattr(creator, "name", "") or ""
-
-    song_id = 0
-    song = getattr(level, "song", None)
-    if song is not None:
-        song_id = int(getattr(song, "id", 0) or 0)
+    creator = str(meta.get("author", "") or "")
+    song_id = int(meta.get("songID", 0) or meta.get("customSong", 0) or 0)
 
     raw = RawLevel(
         level_id=level_id,
-        name=str(getattr(level, "name", "")),
-        creator=creator_name,
+        name=str(meta.get("name", "") or ""),
+        creator=creator,
         rating=rating,
         song_id=song_id,
-        object_count=int(getattr(level, "object_count", 0) or 0),
-        length=_normalize_length(level),
-        platformer=_is_platformer(level),
-        game_version=int(getattr(level, "game_version", 0) or 0),
+        object_count=int(meta.get("objects", 0) or 0),
+        length=_length_from_gdbrowser(meta),
+        platformer=bool(meta.get("platformer", False)),
+        game_version=_game_version_int(meta),
         level_string_raw=level_string,
     )
-
     _write_raw(path, raw)
     _append_manifest(
         cfg,
         ManifestEntry(
             level_id=level_id,
-            creator=creator_name,
+            creator=creator,
             name=raw.name,
             rating=rating,
             object_count=raw.object_count,
@@ -380,7 +385,84 @@ async def _download_and_save(
     log.info("saved %d (%s, %d objs)", level_id, rating.value, raw.object_count)
 
 
-# ---------- public entry point ----------
+# ---------- discovery ----------
+
+
+async def _collect_candidates(
+    http: httpx.AsyncClient,
+    cfg: FetchConfig,
+    bucket: TokenBucket,
+    streak: FailureStreak,
+) -> list[dict]:
+    """Walk GDBrowser search pages for each requested tier, dedupe by id."""
+    seen: set[int] = set()
+    out: list[dict] = []
+
+    for rating in cfg.ratings:
+        search_type = _GDBROWSER_TYPE_FOR_RATING[rating]
+        for page in range(cfg.max_pages_per_query):
+            await bucket.acquire()
+            try:
+                items = await _with_backoff(
+                    _gdbrowser_search,
+                    http,
+                    search_type,
+                    page,
+                    streak=streak,
+                    label=f"search {search_type} p{page}",
+                )
+            except Exception as exc:
+                log.error("search gave up: %s p%d: %r", search_type, page, exc)
+                break
+            if not items:
+                break
+
+            added_this_page = 0
+            for m in items:
+                try:
+                    lid = int(m.get("id", 0))
+                except (TypeError, ValueError):
+                    continue
+                if lid <= 0 or lid in seen:
+                    continue
+                seen.add(lid)
+                out.append(m)
+                added_this_page += 1
+            if added_this_page == 0:
+                break
+            if cfg.max_levels and len(out) >= cfg.max_levels:
+                return out
+    return out
+
+
+async def _candidates_from_manifest(
+    http: httpx.AsyncClient,
+    path: Path,
+    bucket: TokenBucket,
+    streak: FailureStreak,
+) -> list[dict]:
+    """When reproducing, manifest gives level ids. Re-pull metadata for filtering."""
+    ids = _read_manifest_ids(path)
+    out: list[dict] = []
+    for lid in ids:
+        await bucket.acquire()
+        try:
+            resp = await _with_backoff(
+                http.get,
+                f"{GDBROWSER_BASE}/api/level/{lid}",
+                streak=streak,
+                label=f"meta {lid}",
+            )
+            resp.raise_for_status()
+            meta = resp.json()
+            if isinstance(meta, dict):
+                out.append(meta)
+        except Exception as exc:
+            log.warning("skip manifest id %d: %r", lid, exc)
+    return out
+
+
+# ---------- public ----------
 
 
 async def collect_raw(cfg: FetchConfig) -> FetchStats:
@@ -388,29 +470,30 @@ async def collect_raw(cfg: FetchConfig) -> FetchStats:
     stats = FetchStats()
     bucket = TokenBucket(rate_per_sec=cfg.rate_per_sec)
     streak = FailureStreak()
-    sem = asyncio.Semaphore(1)  # §4.2 — strictly sequential.
+    sem = asyncio.Semaphore(1)
 
-    client_kwargs: dict[str, Any] = {}
-    # gd.py >= 1.0 accepts a user_agent kwarg; older builds don't. Probe.
-    try:
-        client = gd.Client(user_agent=USER_AGENT, **client_kwargs)  # type: ignore[call-arg]
-    except TypeError:
-        client = gd.Client(**client_kwargs)
+    async with httpx.AsyncClient(
+        headers={"User-Agent": USER_AGENT},
+        timeout=30.0,
+        follow_redirects=True,
+    ) as http:
+        if cfg.from_manifest is not None:
+            candidates = await _candidates_from_manifest(http, cfg.from_manifest, bucket, streak)
+        else:
+            candidates = await _collect_candidates(http, cfg, bucket, streak)
 
-    async with _maybe_context(client):
-        level_ids = await _gather_level_ids(client, cfg, bucket, streak)
         if cfg.max_levels:
-            level_ids = level_ids[: cfg.max_levels]
-        log.info("discovered %d unique level ids", len(level_ids))
+            candidates = candidates[: cfg.max_levels]
+        log.info("discovered %d candidate levels", len(candidates))
 
-        for i, level_id in enumerate(level_ids):
+        for i, meta in enumerate(candidates):
             async with sem:
-                await _download_and_save(client, level_id, cfg, bucket, streak, stats)
-            if (i + 1) % 50 == 0:
+                await _process_level(http, meta, cfg, bucket, streak, stats)
+            if (i + 1) % 25 == 0:
                 log.info(
                     "progress %d/%d (saved=%d skipped=%d rejected=%d err=%d)",
                     i + 1,
-                    len(level_ids),
+                    len(candidates),
                     stats.fetched,
                     stats.skipped_existing,
                     stats.rejected,
@@ -419,43 +502,5 @@ async def collect_raw(cfg: FetchConfig) -> FetchStats:
     return stats
 
 
-async def _gather_level_ids(
-    client: gd.Client,
-    cfg: FetchConfig,
-    bucket: TokenBucket,
-    streak: FailureStreak,
-) -> list[int]:
-    if cfg.from_manifest is not None:
-        ids = _read_manifest_ids(cfg.from_manifest)
-        log.info("using manifest %s → %d ids", cfg.from_manifest, len(ids))
-        return ids
-
-    collected: list[int] = []
-    seen: set[int] = set()
-    for rating in cfg.ratings:
-        page_ids = await _search_level_ids(client, rating, cfg, bucket, streak)
-        for i in page_ids:
-            if i not in seen:
-                seen.add(i)
-                collected.append(i)
-    return collected
-
-
-class _NullAsyncContext:
-    async def __aenter__(self) -> None:
-        return None
-
-    async def __aexit__(self, *_: Any) -> None:
-        return None
-
-
-def _maybe_context(client: gd.Client) -> Any:
-    """Some gd.py versions are async-context-managers, some aren't."""
-    if hasattr(client, "__aenter__"):
-        return client
-    return _NullAsyncContext()
-
-
 def iter_raw_files(raw_dir: Path) -> Iterable[Path]:
-    """Used by Stage 2 — but exposed here since listing the raw dir belongs to data layer."""
     return sorted(raw_dir.glob("*.json"))
