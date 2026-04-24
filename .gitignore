@@ -30,3 +30,6 @@ data/optout.txt
 # Env
 .env
 *.env.local
+
+# Claude Code local session state
+.claude/

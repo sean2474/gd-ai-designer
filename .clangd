@@ -1,0 +1,8 @@
+CompileFlags:
+  Add:
+    - -std=c++20
+    - -Wno-c++17-extensions
+
+Diagnostics:
+  # 프로젝트는 C++20. clangd 가 표준 미식별하면 이 파일로 덮어씀.
+  UnusedIncludes: Strict
