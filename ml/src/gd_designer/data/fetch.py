@@ -8,13 +8,16 @@ Output: one JSON per level under data/raw/. SQLite migration deferred.
 from __future__ import annotations
 
 import asyncio
+import base64
+import gzip
 import hashlib
+import json
 import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, AsyncIterator, Iterable
 
 import httpx
 
@@ -32,19 +35,19 @@ log = logging.getLogger(__name__)
 
 # ---- endpoints ----
 GDBROWSER_BASE = "https://gdbrowser.com"
-GD_BASE = "http://www.boomlings.com/database"
+GD_BASE = "http://www.boomlings.com/database"  # fallback; primary is GDHistory
+GDHISTORY_BASE = "https://history.geometrydash.eu"
 GD_SECRET = "Wmfd2893gb7"  # public "download level" secret, same value GD client sends
 USER_AGENT = "GDDesignAI-Crawler/0.1.0 (+https://github.com/sean2474/gd-ai-designer)"
 
-# ---- filter thresholds (per DATA_COLLECTION.md §3 + user additions) ----
+# ---- filter thresholds ----
 BACKOFF_SCHEDULE_SEC = (10, 30, 60, 120)
-OBJECT_COUNT_MIN = 10
-OBJECT_COUNT_MAX = 20_000
-MIN_GAME_VERSION = 21       # 2.1+; 2.0 uses different object set
-MIN_UPLOAD_YEAR = 2019      # decoration conventions stabilize after 2019-01-01
+# Version window: GDBrowser gameVersion "1.9"→19, "2.0"→20, "2.1"→21, "2.2"→22.
+# Lower bound 1.9 (pre-1.9 levels use a different object set entirely).
+# No upper bound — 2.2 included for future use.
+MIN_GAME_VERSION = 19
+MAX_GAME_VERSION = 99
 MIN_X_WIDTH_UNITS = 120     # ≥ 2 encoder windows; enforced in Stage 2 (needs parsed data)
-
-_YEARS_AGO = re.compile(r"(\d+)\s*year", re.IGNORECASE)
 
 
 @dataclass
@@ -123,6 +126,20 @@ def _game_version_int(meta: dict) -> int:
 # ---------- GD server response parsing ----------
 
 
+def _safe_int(v: Any, default: int = 0) -> int:
+    """Tolerant int parse for GDBrowser/GD responses where some fields are
+    occasionally non-numeric (e.g., songID returning a track NAME 'Level 5')."""
+    if v is None or v == "":
+        return default
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        try:
+            return int(float(v))
+        except (TypeError, ValueError):
+            return default
+
+
 def _parse_gd_kv(body: str) -> dict[str, str]:
     """RobTop's downloadGJLevel22 returns `k:v:k:v:...#hash`. Parse to dict."""
     head, _, _tail = body.partition("#")
@@ -130,15 +147,30 @@ def _parse_gd_kv(body: str) -> dict[str, str]:
     return {parts[i]: parts[i + 1] for i in range(0, len(parts) - 1, 2)}
 
 
-def _parse_upload_year(uploaded_text: str, today: datetime) -> int | None:
-    """GD returns fuzzy strings like "2 years" / "5 months" / "3 weeks". Best-effort year."""
-    if not uploaded_text:
-        return None
-    m = _YEARS_AGO.search(uploaded_text)
-    if m:
-        return today.year - int(m.group(1))
-    # months/weeks/days all mean same-year-ish — return current year.
-    return today.year
+def _parse_kv_comma(s: str) -> dict[str, str]:
+    """GD level header / objects are `k,v,k,v,...` comma-separated."""
+    if not s:
+        return {}
+    parts = s.split(",")
+    return {parts[i]: parts[i + 1] for i in range(0, len(parts) - 1, 2)}
+
+
+def decode_level_string(encoded: str) -> tuple[dict[str, str], list[dict[str, str]]]:
+    """Decode GD's key-4 field: url-safe base64 → gzip → ASCII.
+
+    Returns (level_header, objects). Format:
+        "<kA1,v,kA2,v,...>;<obj1 k,v,...>;<obj2 k,v,...>;...;"
+    Trailing empty segments from the final `;` are dropped.
+    """
+    if not encoded:
+        return {}, []
+    padded = encoded + "=" * (-len(encoded) % 4)
+    compressed = base64.urlsafe_b64decode(padded)
+    data_str = gzip.decompress(compressed).decode("utf-8", errors="replace")
+    sections = data_str.split(";")
+    header = _parse_kv_comma(sections[0]) if sections else {}
+    objects = [_parse_kv_comma(s) for s in sections[1:] if s]
+    return header, objects
 
 
 # ---------- IO ----------
@@ -177,6 +209,27 @@ def _append_manifest(cfg: FetchConfig, entry: ManifestEntry) -> None:
 
 def _sha256(s: str) -> str:
     return "sha256:" + hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def _state_path(cfg: FetchConfig) -> Path:
+    return cfg.output_dir.parent / "crawl_state.json"
+
+
+def _load_state(path: Path) -> dict[str, int]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.warning("could not load crawl state %s: %r", path, exc)
+        return {}
+
+
+def _save_state(path: Path, state: dict[str, int]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(state), encoding="utf-8")
+    tmp.replace(path)
 
 
 def _read_manifest_ids(path: Path) -> list[int]:
@@ -241,7 +294,7 @@ async def _gdbrowser_search(
 
 
 async def _gd_download(http: httpx.AsyncClient, level_id: int) -> dict[str, str]:
-    """Direct RobTop download. Requires empty UA (GD client sends no UA)."""
+    """Direct RobTop download — fallback path. Aggressively rate-limited (429s)."""
     resp = await http.post(
         f"{GD_BASE}/downloadGJLevel22.php",
         data={"levelID": str(level_id), "secret": GD_SECRET},
@@ -252,6 +305,67 @@ async def _gd_download(http: httpx.AsyncClient, level_id: int) -> dict[str, str]
     if body.strip() == "-1":
         raise ValueError(f"GD server returned -1 for level {level_id}")
     return _parse_gd_kv(body)
+
+
+_GMD_K_RE = re.compile(r"<k>(k\d+)</k>\s*<[isr]>([^<]*)</[isr]>")
+
+
+def _parse_gmd(gmd_text: str) -> dict[str, str]:
+    """Pull out k4 (level data) and other k* fields from a GMD plist."""
+    return {k: v for k, v in _GMD_K_RE.findall(gmd_text)}
+
+
+async def _gdhistory_meta(http: httpx.AsyncClient, level_id: int) -> dict:
+    resp = await http.get(f"{GDHISTORY_BASE}/api/v1/level/{level_id}/")
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def _gdhistory_download(
+    http: httpx.AsyncClient, level_id: int, record_id: int
+) -> str:
+    """Download GMD plist text from GDHistory for a specific record."""
+    resp = await http.get(
+        f"{GDHISTORY_BASE}/level/{level_id}/{record_id}/download/"
+    )
+    resp.raise_for_status()
+    return resp.text
+
+
+def _pick_record(meta: dict) -> int | None:
+    """Pick the newest record that actually has the level string available."""
+    records = meta.get("records") or []
+    candidates = [r for r in records if r.get("level_string_available")]
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda r: r.get("cache_real_date", "") or "", reverse=True
+    )
+    return int(candidates[0]["id"])
+
+
+async def _fetch_level_kv_via_gdhistory(
+    http: httpx.AsyncClient, level_id: int
+) -> dict[str, str] | None:
+    """Try GDHistory first. Returns key-value dict shaped like RobTop's response
+    (minimum: key 4 = level string), or None if GDHistory has no usable record."""
+    meta = await _gdhistory_meta(http, level_id)
+    if not meta.get("cache_level_string_available"):
+        return None
+    rec_id = _pick_record(meta)
+    if rec_id is None:
+        return None
+    gmd_text = await _gdhistory_download(http, level_id, rec_id)
+    kv = _parse_gmd(gmd_text)
+    if "k4" not in kv:
+        return None
+    # Map GMD's k* keys to RobTop's numeric keys for downstream compatibility.
+    out: dict[str, str] = {"4": kv["k4"]}
+    if "k1" in kv:
+        out["1"] = kv["k1"]
+    if "k2" in kv:
+        out["2"] = kv["k2"]
+    return out
 
 
 # ---------- filters ----------
@@ -269,13 +383,11 @@ def _check_metadata(
     if cfg.exclude_platformer and meta.get("platformer"):
         return rating, RejectionReason.PLATFORMER, ""
 
-    obj_count = int(meta.get("objects", 0) or 0)
-    if not (OBJECT_COUNT_MIN <= obj_count <= OBJECT_COUNT_MAX):
-        return rating, RejectionReason.OBJECT_COUNT_OUT_OF_RANGE, f"n={obj_count}"
-
     gv = _game_version_int(meta)
     if gv and gv < MIN_GAME_VERSION:
         return rating, RejectionReason.GAME_VERSION_TOO_OLD, f"gv={gv}"
+    if gv and gv > MAX_GAME_VERSION:
+        return rating, RejectionReason.GAME_VERSION_TOO_NEW, f"gv={gv}"
 
     return rating, None, ""
 
@@ -312,22 +424,43 @@ async def _process_level(
         return
     assert rating is not None
 
-    await bucket.acquire()
+    # Primary: GDHistory (Cloudflare-cached, kinder rate limits).
+    # Fallback: RobTop boomlings.com (gets 429'd quickly).
+    kv: dict[str, str] | None = None
     try:
+        await bucket.acquire()
         kv = await _with_backoff(
-            _gd_download, http, level_id, streak=streak, label=f"download {level_id}"
+            _fetch_level_kv_via_gdhistory,
+            http,
+            level_id,
+            streak=streak,
+            label=f"gdhistory {level_id}",
         )
     except Exception as exc:
-        stats.errors += 1
-        _append_rejection(
-            cfg,
-            RejectionEntry(
-                level_id=level_id,
-                reason=RejectionReason.FETCH_ERROR,
-                detail=repr(exc)[:200],
-            ),
-        )
-        return
+        log.debug("gdhistory failed for %d: %r — falling back", level_id, exc)
+        kv = None
+
+    if kv is None:
+        try:
+            await bucket.acquire()
+            kv = await _with_backoff(
+                _gd_download,
+                http,
+                level_id,
+                streak=streak,
+                label=f"boomlings {level_id}",
+            )
+        except Exception as exc:
+            stats.errors += 1
+            _append_rejection(
+                cfg,
+                RejectionEntry(
+                    level_id=level_id,
+                    reason=RejectionReason.FETCH_ERROR,
+                    detail=repr(exc)[:200],
+                ),
+            )
+            return
 
     level_string = kv.get("4", "")
     if not level_string:
@@ -338,23 +471,25 @@ async def _process_level(
         )
         return
 
-    # Secondary filter: upload year (key 28 = "X years/months/weeks ago" text).
-    now = datetime.now(timezone.utc)
-    upload_year = _parse_upload_year(kv.get("28", ""), now)
-    if upload_year is not None and upload_year < MIN_UPLOAD_YEAR:
-        stats.rejected += 1
-        _append_rejection(
-            cfg,
-            RejectionEntry(
-                level_id=level_id,
-                reason=RejectionReason.GAME_VERSION_TOO_OLD,
-                detail=f"uploaded ~{upload_year} (< {MIN_UPLOAD_YEAR})",
-            ),
-        )
-        return
-
     creator = str(meta.get("author", "") or "")
-    song_id = int(meta.get("songID", 0) or meta.get("customSong", 0) or 0)
+    # GDBrowser returns "songID": "Level 5" (string name) for the original
+    # game's official tracks; only customSong is numeric. Try numeric paths
+    # first, fall back to officialSong index, finally 0.
+    song_id = _safe_int(meta.get("customSong")) or _safe_int(meta.get("songID"))
+    if not song_id:
+        song_id = _safe_int(meta.get("officialSong"))
+
+    # GDBrowser's "objects" meta is occasionally 0 even for non-empty levels
+    # (older or recently re-uploaded levels). Decode the actual level string
+    # and count semicolons → real object count. Fall back to meta on parse
+    # failure so we still record something.
+    try:
+        _, decoded_objs = decode_level_string(level_string)
+        decoded_count = len(decoded_objs)
+    except Exception:
+        decoded_count = 0
+    meta_count = _safe_int(meta.get("objects"))
+    actual_object_count = decoded_count if decoded_count > 0 else meta_count
 
     raw = RawLevel(
         level_id=level_id,
@@ -362,7 +497,7 @@ async def _process_level(
         creator=creator,
         rating=rating,
         song_id=song_id,
-        object_count=int(meta.get("objects", 0) or 0),
+        object_count=actual_object_count,
         length=_length_from_gdbrowser(meta),
         platformer=bool(meta.get("platformer", False)),
         game_version=_game_version_int(meta),
@@ -388,19 +523,27 @@ async def _process_level(
 # ---------- discovery ----------
 
 
-async def _collect_candidates(
+async def _stream_search(
     http: httpx.AsyncClient,
     cfg: FetchConfig,
     bucket: TokenBucket,
     streak: FailureStreak,
-) -> list[dict]:
-    """Walk GDBrowser search pages for each requested tier, dedupe by id."""
-    seen: set[int] = set()
-    out: list[dict] = []
+) -> "AsyncIterator[dict]":
+    """Yield GDBrowser search results across all requested tiers, deduped.
 
+    Resumable via `state_path` (a JSON file mapping rating-name → last completed
+    page). On startup we resume from `last_page + 1`; after each page we
+    persist progress so a kill+restart picks up where we left off.
+    """
+    state_path = _state_path(cfg)
+    state = _load_state(state_path)
+    seen: set[int] = set()
     for rating in cfg.ratings:
         search_type = _GDBROWSER_TYPE_FOR_RATING[rating]
-        for page in range(cfg.max_pages_per_query):
+        start_page = state.get(rating.value, -1) + 1
+        if start_page > 0:
+            log.info("resuming %s from page %d", search_type, start_page)
+        for page in range(start_page, cfg.max_pages_per_query):
             await bucket.acquire()
             try:
                 items = await _with_backoff(
@@ -426,24 +569,22 @@ async def _collect_candidates(
                 if lid <= 0 or lid in seen:
                     continue
                 seen.add(lid)
-                out.append(m)
                 added_this_page += 1
+                yield m
+            state[rating.value] = page
+            _save_state(state_path, state)
             if added_this_page == 0:
                 break
-            if cfg.max_levels and len(out) >= cfg.max_levels:
-                return out
-    return out
 
 
-async def _candidates_from_manifest(
+async def _stream_manifest(
     http: httpx.AsyncClient,
     path: Path,
     bucket: TokenBucket,
     streak: FailureStreak,
-) -> list[dict]:
-    """When reproducing, manifest gives level ids. Re-pull metadata for filtering."""
+) -> "AsyncIterator[dict]":
+    """Re-pull metadata from GDBrowser for each id in an existing manifest."""
     ids = _read_manifest_ids(path)
-    out: list[dict] = []
     for lid in ids:
         await bucket.acquire()
         try:
@@ -455,11 +596,11 @@ async def _candidates_from_manifest(
             )
             resp.raise_for_status()
             meta = resp.json()
-            if isinstance(meta, dict):
-                out.append(meta)
         except Exception as exc:
             log.warning("skip manifest id %d: %r", lid, exc)
-    return out
+            continue
+        if isinstance(meta, dict):
+            yield meta
 
 
 # ---------- public ----------
@@ -478,22 +619,22 @@ async def collect_raw(cfg: FetchConfig) -> FetchStats:
         follow_redirects=True,
     ) as http:
         if cfg.from_manifest is not None:
-            candidates = await _candidates_from_manifest(http, cfg.from_manifest, bucket, streak)
+            source = _stream_manifest(http, cfg.from_manifest, bucket, streak)
         else:
-            candidates = await _collect_candidates(http, cfg, bucket, streak)
+            source = _stream_search(http, cfg, bucket, streak)
 
-        if cfg.max_levels:
-            candidates = candidates[: cfg.max_levels]
-        log.info("discovered %d candidate levels", len(candidates))
-
-        for i, meta in enumerate(candidates):
+        seen_candidates = 0
+        async for meta in source:
+            seen_candidates += 1
             async with sem:
                 await _process_level(http, meta, cfg, bucket, streak, stats)
-            if (i + 1) % 25 == 0:
+            if cfg.max_levels and stats.fetched >= cfg.max_levels:
+                log.info("reached max_levels=%d saved, stopping", cfg.max_levels)
+                break
+            if seen_candidates % 25 == 0:
                 log.info(
-                    "progress %d/%d (saved=%d skipped=%d rejected=%d err=%d)",
-                    i + 1,
-                    len(candidates),
+                    "progress %d cand (saved=%d skipped=%d rejected=%d err=%d)",
+                    seen_candidates,
                     stats.fetched,
                     stats.skipped_existing,
                     stats.rejected,

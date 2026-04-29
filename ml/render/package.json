@@ -1,0 +1,16 @@
+{
+  "name": "gd-render-harness",
+  "version": "0.1.0",
+  "description": "Headless render harness using GDRWeb",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "@iliashdz/gdrweb": "github:iliasHDZ/GDRWeb"
+  },
+  "devDependencies": {
+    "vite": "^5.0.0"
+  }
+}

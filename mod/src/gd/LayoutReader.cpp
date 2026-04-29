@@ -12,8 +12,6 @@ using namespace geode::prelude;
 
 namespace designer::gd {
 
-namespace {
-
 // Map GD's runtime-classified GameObjectType to our coarse ObjectKind.
 // See $GEODE_SDK/bindings/<ver>/bindings/include/Geode/Enums.hpp for the full
 // enum (47 values). We group them into the abstract kinds the designer cares
@@ -83,7 +81,25 @@ core::ObjectKind kindFromType(GameObjectType t) {
     }
 }
 
-} // namespace
+core::ObjectKind classify(int32_t gdId, GameObjectType t) {
+    // 1) Per-id catalog override beats GD's coarse type — this is how
+    //    triggers split into TRIGGER_VISUAL vs TRIGGER_GAMEPLAY.
+    auto override_kind = core::ids::kindOf(gdId);
+    if (override_kind != core::ObjectKind::UNKNOWN) return override_kind;
+
+    // 2) GD's GameObjectType when it's specific enough (Solid/Hazard/Portal/...).
+    auto type_kind = kindFromType(t);
+    if (type_kind != core::ObjectKind::UNKNOWN) return type_kind;
+
+    // 3) Type-based fallback for the broad buckets GD lumps together.
+    //    20/22 are trigger-ish in the dump; default to GAMEPLAY (safer to keep).
+    //    30/31 are pickups; 40 is special interaction.
+    const int ti = static_cast<int>(t);
+    if (ti == 20 || ti == 22) return core::ObjectKind::TRIGGER_GAMEPLAY;
+    if (ti == 30 || ti == 31) return core::ObjectKind::COLLECTIBLE;
+    if (ti == 40)             return core::ObjectKind::SPECIAL;
+    return core::ObjectKind::UNKNOWN;
+}
 
 core::Layout readLayout(LevelEditorLayer* editor) {
     core::Layout out;

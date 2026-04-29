@@ -35,3 +35,14 @@ data/optout.txt
 .claude/*
 !.claude/agents/
 !.claude/commands/
+
+data/*
+
+# Node / GDRWeb harness build state
+**/node_modules/
+**/dist/
+ml/render/gdrweb-src/
+ml/render/.venv/
+
+# Playwright browsers cache (auto-installed)
+**/.playwright/

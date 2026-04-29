@@ -7,6 +7,7 @@
 #include "../gd/DecorationApplier.hpp"
 #include "../gd/LayoutReader.hpp"
 #include "../strategies/RuleBasedStrategy.hpp"
+#include "../tools/DumpObjectIDs.hpp"
 
 #include <Geode/Geode.hpp>
 #include <Geode/binding/LevelEditorLayer.hpp>
@@ -20,19 +21,23 @@ class $modify(DesignerEditorUI, EditorUI) {
     bool init(LevelEditorLayer* editor) {
         if (!EditorUI::init(editor)) return false;
 
-        auto sprite = ButtonSprite::create(
+        auto designSprite = ButtonSprite::create(
             "Design", "bigFont.fnt", "GJ_button_01.png", 0.6f);
+        auto designBtn = CCMenuItemSpriteExtra::create(
+            designSprite, this, menu_selector(DesignerEditorUI::onDesign));
+        designBtn->setID("design-btn"_spr);
 
-        auto btn = CCMenuItemSpriteExtra::create(
-            sprite,
-            this,
-            menu_selector(DesignerEditorUI::onDesign)
-        );
-        btn->setID("design-btn"_spr);
+        auto dumpSprite = ButtonSprite::create(
+            "Dump IDs", "bigFont.fnt", "GJ_button_04.png", 0.5f);
+        auto dumpBtn = CCMenuItemSpriteExtra::create(
+            dumpSprite, this, menu_selector(DesignerEditorUI::onDumpIDs));
+        dumpBtn->setID("dump-ids-btn"_spr);
+        dumpBtn->setPositionY(-30.f);
 
         auto menu = CCMenu::create();
         menu->setID("designer-menu"_spr);
-        menu->addChild(btn);
+        menu->addChild(designBtn);
+        menu->addChild(dumpBtn);
         menu->setPosition({
             60.f,
             CCDirector::sharedDirector()->getWinSize().height - 30.f
@@ -40,6 +45,25 @@ class $modify(DesignerEditorUI, EditorUI) {
         this->addChild(menu, 100);
 
         return true;
+    }
+
+    void onDumpIDs(CCObject*) {
+        auto editor = LevelEditorLayer::get();
+        if (!editor) {
+            FLAlertLayer::create("Dump IDs", "No editor instance.", "OK")->show();
+            return;
+        }
+        // Hardcoded path so the ML pipeline picks it up directly. Dev tool.
+        const std::filesystem::path out =
+            "/Users/sean2474/Desktop/project/gd-design-ai/data/object_ids.json";
+        const int n = designer::tools::dumpObjectIDsToJson(editor, out, 3000);
+        log::info("DumpObjectIDs: wrote {} entries to {}", n, out.string());
+        FLAlertLayer::create(
+            "Dump IDs",
+            fmt::format("Wrote <cy>{}</c> entries to\n<cg>{}</c>",
+                        n, out.string()).c_str(),
+            "OK"
+        )->show();
     }
 
     void onDesign(CCObject*) {
